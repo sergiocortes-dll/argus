@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use render::{FontConfig, Frame, Renderer, Rgba};
+use terminal_infra::{Pty, PtyEvent, PtyGrid, ShellCommand};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
 const BACKGROUND: Rgba = Rgba {
@@ -19,38 +20,71 @@ const FOREGROUND: Rgba = Rgba {
     b: 0.9,
     a: 1.0,
 };
+const ESC: char = '\u{1b}';
+const BEL: char = '\u{7}';
+const CURSOR_POSITION_REQUEST: &[u8] = b"\x1b[6n";
+const CURSOR_POSITION_REPORT: &[u8] = b"\x1b[1;1R";
 
-#[derive(Default)]
+#[derive(Debug)]
+enum AppEvent {
+    Pty(PtyEvent),
+}
+
 struct App {
+    proxy: EventLoopProxy<AppEvent>,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    pty: Option<Pty>,
+    output: Vec<u8>,
 }
 
 impl App {
-    fn demo_text(&self) -> String {
-        let Some(renderer) = &self.renderer else {
-            return String::new();
-        };
-        let (cols, rows) = renderer.grid_size();
-        let cell = renderer.cell_size();
-        let ruler: String = (0..cols)
-            .map(|i| char::from(b'0' + (i % 10) as u8))
-            .collect();
-        format!(
-            "Argus — grid {cols}x{rows}, cell {:.1}x{:.1}px\n\
-             {ruler}\n\
-             ABCDEFGHIJKLMNOPQRSTUVWXYZ abcdefghijklmnopqrstuvwxyz 0123456789\n\
-             áéíóú ñÑ ¿? ¡! → ← ✓ ✗ λ\n\
-             ┌──────┬──────┐\n\
-             │ box  │ draw │\n\
-             └──────┴──────┘\n\
-             ilIl1| WWWWWW mmmmmm ......",
-            cell.width, cell.height
-        )
+    fn new(proxy: EventLoopProxy<AppEvent>) -> Self {
+        Self {
+            proxy,
+            window: None,
+            renderer: None,
+            pty: None,
+            output: Vec::new(),
+        }
+    }
+
+    fn grid(&self) -> PtyGrid {
+        let (cols, rows) = self.renderer.as_ref().map_or((80, 24), Renderer::grid_size);
+        PtyGrid {
+            cols: u16::try_from(cols).unwrap_or(u16::MAX),
+            rows: u16::try_from(rows).unwrap_or(u16::MAX),
+        }
+    }
+
+    fn spawn_shell(&mut self) {
+        let proxy = self.proxy.clone();
+        let command = ShellCommand::default_shell();
+        log::info!("shell: {}", command.program);
+        match Pty::spawn(command, self.grid(), move |event| {
+            let _ = proxy.send_event(AppEvent::Pty(event));
+        }) {
+            Ok(pty) => self.pty = Some(pty),
+            Err(e) => log::error!("spawn shell: {e:#}"),
+        }
+    }
+
+    // Temporary view until the VT emulator lands (F0-5).
+    fn screen_text(&self) -> String {
+        let rows = self.grid().rows as usize;
+        let text = strip_escapes(&String::from_utf8_lossy(&self.output));
+        let lines: Vec<&str> = text.lines().collect();
+        lines[lines.len().saturating_sub(rows)..].join("\n")
+    }
+
+    fn request_redraw(&self) {
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<AppEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -83,6 +117,27 @@ impl ApplicationHandler for App {
         }
         window.request_redraw();
         self.window = Some(window);
+        self.spawn_shell();
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
+        match event {
+            AppEvent::Pty(PtyEvent::Output(bytes)) => {
+                if bytes
+                    .windows(CURSOR_POSITION_REQUEST.len())
+                    .any(|w| w == CURSOR_POSITION_REQUEST)
+                    && let Some(pty) = &mut self.pty
+                {
+                    let _ = pty.write(CURSOR_POSITION_REPORT);
+                }
+                self.output.extend(bytes);
+                self.request_redraw();
+            }
+            AppEvent::Pty(PtyEvent::Exited(code)) => {
+                log::info!("shell exited: {code:?}");
+                event_loop.exit();
+            }
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -92,20 +147,22 @@ impl ApplicationHandler for App {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(size.width, size.height);
                 }
-                if let Some(window) = &self.window {
-                    window.request_redraw();
+                let grid = self.grid();
+                if let Some(pty) = &self.pty
+                    && let Err(e) = pty.resize(grid)
+                {
+                    log::warn!("resize pty: {e:#}");
                 }
+                self.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.set_scale(scale_factor as f32);
                 }
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
+                self.request_redraw();
             }
             WindowEvent::RedrawRequested => {
-                let text = self.demo_text();
+                let text = self.screen_text();
                 if let Some(renderer) = &mut self.renderer {
                     let frame = Frame {
                         background: BACKGROUND,
@@ -125,8 +182,39 @@ impl ApplicationHandler for App {
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let event_loop = EventLoop::new()?;
+    let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
-    event_loop.run_app(&mut App::default())?;
+    let mut app = App::new(event_loop.create_proxy());
+    event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+fn strip_escapes(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            ESC => match chars.next() {
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == BEL || (c == ESC && chars.next_if_eq(&'\\').is_some()) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            '\n' => out.push('\n'),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
