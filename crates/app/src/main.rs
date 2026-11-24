@@ -1,29 +1,12 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use render::{FontConfig, Frame, Renderer, Rgba};
-use terminal_infra::{Pty, PtyEvent, PtyGrid, ShellCommand};
+use render::{FontConfig, GridCell, GridFrame, Renderer};
+use terminal_infra::{Emulator, Pty, PtyEvent, PtyGrid, ScreenCell, ShellCommand};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
-
-const BACKGROUND: Rgba = Rgba {
-    r: 0.04,
-    g: 0.05,
-    b: 0.07,
-    a: 1.0,
-};
-const FOREGROUND: Rgba = Rgba {
-    r: 0.85,
-    g: 0.87,
-    b: 0.9,
-    a: 1.0,
-};
-const ESC: char = '\u{1b}';
-const BEL: char = '\u{7}';
-const CURSOR_POSITION_REQUEST: &[u8] = b"\x1b[6n";
-const CURSOR_POSITION_REPORT: &[u8] = b"\x1b[1;1R";
 
 #[derive(Debug)]
 enum AppEvent {
@@ -35,7 +18,8 @@ struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     pty: Option<Pty>,
-    output: Vec<u8>,
+    emulator: Emulator,
+    cells: Vec<GridCell>,
 }
 
 impl App {
@@ -45,23 +29,20 @@ impl App {
             window: None,
             renderer: None,
             pty: None,
-            output: Vec::new(),
+            emulator: Emulator::new(80, 24),
+            cells: Vec::new(),
         }
     }
 
-    fn grid(&self) -> PtyGrid {
-        let (cols, rows) = self.renderer.as_ref().map_or((80, 24), Renderer::grid_size);
-        PtyGrid {
-            cols: u16::try_from(cols).unwrap_or(u16::MAX),
-            rows: u16::try_from(rows).unwrap_or(u16::MAX),
-        }
+    fn grid(&self) -> (usize, usize) {
+        self.renderer.as_ref().map_or((80, 24), Renderer::grid_size)
     }
 
     fn spawn_shell(&mut self) {
         let proxy = self.proxy.clone();
         let command = ShellCommand::default_shell();
         log::info!("shell: {}", command.program);
-        match Pty::spawn(command, self.grid(), move |event| {
+        match Pty::spawn(command, pty_grid(self.grid()), move |event| {
             let _ = proxy.send_event(AppEvent::Pty(event));
         }) {
             Ok(pty) => self.pty = Some(pty),
@@ -69,12 +50,48 @@ impl App {
         }
     }
 
-    // Temporary view until the VT emulator lands (F0-5).
-    fn screen_text(&self) -> String {
-        let rows = self.grid().rows as usize;
-        let text = strip_escapes(&String::from_utf8_lossy(&self.output));
-        let lines: Vec<&str> = text.lines().collect();
-        lines[lines.len().saturating_sub(rows)..].join("\n")
+    fn resize_grid(&mut self) {
+        let (cols, rows) = self.grid();
+        if self.emulator.size() == (cols, rows) {
+            return;
+        }
+        self.emulator.resize(cols, rows);
+        if let Some(pty) = &self.pty
+            && let Err(e) = pty.resize(pty_grid((cols, rows)))
+        {
+            log::warn!("resize pty: {e:#}");
+        }
+    }
+
+    fn on_output(&mut self, bytes: &[u8]) {
+        self.emulator.feed(bytes);
+        let replies = self.emulator.take_replies();
+        if !replies.is_empty()
+            && let Some(pty) = &mut self.pty
+            && let Err(e) = pty.write(&replies)
+        {
+            log::warn!("reply to pty: {e:#}");
+        }
+        if let Some(title) = self.emulator.take_title()
+            && let Some(window) = &self.window
+        {
+            window.set_title(&format!("{title} — Argus"));
+        }
+        self.request_redraw();
+    }
+
+    fn draw(&mut self) -> Result<()> {
+        let screen = self.emulator.screen();
+        self.cells.clear();
+        self.cells.extend(screen.cells.iter().map(to_grid_cell));
+        let Some(renderer) = &mut self.renderer else {
+            return Ok(());
+        };
+        renderer.render(GridFrame {
+            cols: screen.cols,
+            background: screen.background,
+            cells: &self.cells,
+        })
     }
 
     fn request_redraw(&self) {
@@ -115,24 +132,15 @@ impl ApplicationHandler<AppEvent> for App {
                 return;
             }
         }
-        window.request_redraw();
         self.window = Some(window);
+        self.resize_grid();
         self.spawn_shell();
+        self.request_redraw();
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
-            AppEvent::Pty(PtyEvent::Output(bytes)) => {
-                if bytes
-                    .windows(CURSOR_POSITION_REQUEST.len())
-                    .any(|w| w == CURSOR_POSITION_REQUEST)
-                    && let Some(pty) = &mut self.pty
-                {
-                    let _ = pty.write(CURSOR_POSITION_REPORT);
-                }
-                self.output.extend(bytes);
-                self.request_redraw();
-            }
+            AppEvent::Pty(PtyEvent::Output(bytes)) => self.on_output(&bytes),
             AppEvent::Pty(PtyEvent::Exited(code)) => {
                 log::info!("shell exited: {code:?}");
                 event_loop.exit();
@@ -147,36 +155,43 @@ impl ApplicationHandler<AppEvent> for App {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(size.width, size.height);
                 }
-                let grid = self.grid();
-                if let Some(pty) = &self.pty
-                    && let Err(e) = pty.resize(grid)
-                {
-                    log::warn!("resize pty: {e:#}");
-                }
+                self.resize_grid();
                 self.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.set_scale(scale_factor as f32);
                 }
+                self.resize_grid();
                 self.request_redraw();
             }
             WindowEvent::RedrawRequested => {
-                let text = self.screen_text();
-                if let Some(renderer) = &mut self.renderer {
-                    let frame = Frame {
-                        background: BACKGROUND,
-                        foreground: FOREGROUND,
-                        text: &text,
-                    };
-                    if let Err(e) = renderer.render(frame) {
-                        log::error!("render: {e:#}");
-                        event_loop.exit();
-                    }
+                if let Err(e) = self.draw() {
+                    log::error!("render: {e:#}");
+                    event_loop.exit();
                 }
             }
             _ => {}
         }
+    }
+}
+
+fn pty_grid((cols, rows): (usize, usize)) -> PtyGrid {
+    PtyGrid {
+        cols: u16::try_from(cols).unwrap_or(u16::MAX),
+        rows: u16::try_from(rows).unwrap_or(u16::MAX),
+    }
+}
+
+fn to_grid_cell(c: &ScreenCell) -> GridCell {
+    GridCell {
+        ch: c.ch,
+        fg: c.fg,
+        bg: c.bg,
+        bold: c.bold,
+        italic: c.italic,
+        underline: c.underline,
+        spacer: c.spacer,
     }
 }
 
@@ -187,34 +202,4 @@ fn main() -> Result<()> {
     let mut app = App::new(event_loop.create_proxy());
     event_loop.run_app(&mut app)?;
     Ok(())
-}
-
-fn strip_escapes(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            ESC => match chars.next() {
-                Some('[') => {
-                    for c in chars.by_ref() {
-                        if ('@'..='~').contains(&c) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    while let Some(c) = chars.next() {
-                        if c == BEL || (c == ESC && chars.next_if_eq(&'\\').is_some()) {
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            },
-            '\n' => out.push('\n'),
-            c if c.is_control() => {}
-            c => out.push(c),
-        }
-    }
-    out
 }
