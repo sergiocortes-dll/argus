@@ -3,9 +3,10 @@ use std::sync::{Arc, Mutex};
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{CursorShape, Processor, Rgb};
 
+use crate::keys::InputModes;
 use crate::palette::{Palette, dim};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +117,12 @@ impl Emulator {
 
     pub fn size(&self) -> (usize, usize) {
         (self.term.columns(), self.term.screen_lines())
+    }
+
+    pub fn input_modes(&self) -> InputModes {
+        InputModes {
+            app_cursor: self.term.mode().contains(TermMode::APP_CURSOR),
+        }
     }
 
     pub fn screen(&self) -> Screen {

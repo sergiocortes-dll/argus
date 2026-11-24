@@ -2,10 +2,13 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use render::{FontConfig, GridCell, GridFrame, Renderer};
-use terminal_infra::{Emulator, Pty, PtyEvent, PtyGrid, ScreenCell, ShellCommand};
+use terminal_infra::{
+    Emulator, Key, Mods, NamedKey, Pty, PtyEvent, PtyGrid, ScreenCell, ShellCommand, encode_key,
+};
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::keyboard::{Key as WinitKey, NamedKey as WinitNamedKey};
 use winit::window::{Window, WindowId};
 
 #[derive(Debug)]
@@ -20,6 +23,7 @@ struct App {
     pty: Option<Pty>,
     emulator: Emulator,
     cells: Vec<GridCell>,
+    mods: Mods,
 }
 
 impl App {
@@ -31,6 +35,32 @@ impl App {
             pty: None,
             emulator: Emulator::new(80, 24),
             cells: Vec::new(),
+            mods: Mods::default(),
+        }
+    }
+
+    fn on_key(&mut self, event: &KeyEvent) {
+        if event.state != ElementState::Pressed {
+            return;
+        }
+        let key = match &event.logical_key {
+            WinitKey::Named(named) => match map_named(*named) {
+                Some(named) => Key::Named(named),
+                None => return,
+            },
+            WinitKey::Character(base) => Key::Char {
+                base: base.as_str(),
+                text: event.text.as_deref(),
+            },
+            _ => return,
+        };
+        let Some(bytes) = encode_key(&key, self.mods, self.emulator.input_modes()) else {
+            return;
+        };
+        if let Some(pty) = &mut self.pty
+            && let Err(e) = pty.write(&bytes)
+        {
+            log::warn!("write key to pty: {e:#}");
         }
     }
 
@@ -151,6 +181,15 @@ impl ApplicationHandler<AppEvent> for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::ModifiersChanged(modifiers) => {
+                let state = modifiers.state();
+                self.mods = Mods {
+                    shift: state.shift_key(),
+                    ctrl: state.control_key(),
+                    alt: state.alt_key(),
+                };
+            }
+            WindowEvent::KeyboardInput { event, .. } => self.on_key(&event),
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(size.width, size.height);
@@ -181,6 +220,39 @@ fn pty_grid((cols, rows): (usize, usize)) -> PtyGrid {
         cols: u16::try_from(cols).unwrap_or(u16::MAX),
         rows: u16::try_from(rows).unwrap_or(u16::MAX),
     }
+}
+
+fn map_named(key: WinitNamedKey) -> Option<NamedKey> {
+    Some(match key {
+        WinitNamedKey::Enter => NamedKey::Enter,
+        WinitNamedKey::Backspace => NamedKey::Backspace,
+        WinitNamedKey::Tab => NamedKey::Tab,
+        WinitNamedKey::Escape => NamedKey::Escape,
+        WinitNamedKey::Space => NamedKey::Space,
+        WinitNamedKey::ArrowUp => NamedKey::Up,
+        WinitNamedKey::ArrowDown => NamedKey::Down,
+        WinitNamedKey::ArrowLeft => NamedKey::Left,
+        WinitNamedKey::ArrowRight => NamedKey::Right,
+        WinitNamedKey::Home => NamedKey::Home,
+        WinitNamedKey::End => NamedKey::End,
+        WinitNamedKey::Insert => NamedKey::Insert,
+        WinitNamedKey::Delete => NamedKey::Delete,
+        WinitNamedKey::PageUp => NamedKey::PageUp,
+        WinitNamedKey::PageDown => NamedKey::PageDown,
+        WinitNamedKey::F1 => NamedKey::F(1),
+        WinitNamedKey::F2 => NamedKey::F(2),
+        WinitNamedKey::F3 => NamedKey::F(3),
+        WinitNamedKey::F4 => NamedKey::F(4),
+        WinitNamedKey::F5 => NamedKey::F(5),
+        WinitNamedKey::F6 => NamedKey::F(6),
+        WinitNamedKey::F7 => NamedKey::F(7),
+        WinitNamedKey::F8 => NamedKey::F(8),
+        WinitNamedKey::F9 => NamedKey::F(9),
+        WinitNamedKey::F10 => NamedKey::F(10),
+        WinitNamedKey::F11 => NamedKey::F(11),
+        WinitNamedKey::F12 => NamedKey::F(12),
+        _ => return None,
+    })
 }
 
 fn to_grid_cell(c: &ScreenCell) -> GridCell {
