@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use render::{Renderer, Rgba};
+use render::{FontConfig, Frame, Renderer, Rgba};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -13,11 +13,41 @@ const BACKGROUND: Rgba = Rgba {
     b: 0.07,
     a: 1.0,
 };
+const FOREGROUND: Rgba = Rgba {
+    r: 0.85,
+    g: 0.87,
+    b: 0.9,
+    a: 1.0,
+};
 
 #[derive(Default)]
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+}
+
+impl App {
+    fn demo_text(&self) -> String {
+        let Some(renderer) = &self.renderer else {
+            return String::new();
+        };
+        let (cols, rows) = renderer.grid_size();
+        let cell = renderer.cell_size();
+        let ruler: String = (0..cols)
+            .map(|i| char::from(b'0' + (i % 10) as u8))
+            .collect();
+        format!(
+            "Argus — grid {cols}x{rows}, cell {:.1}x{:.1}px\n\
+             {ruler}\n\
+             ABCDEFGHIJKLMNOPQRSTUVWXYZ abcdefghijklmnopqrstuvwxyz 0123456789\n\
+             áéíóú ñÑ ¿? ¡! → ← ✓ ✗ λ\n\
+             ┌──────┬──────┐\n\
+             │ box  │ draw │\n\
+             └──────┴──────┘\n\
+             ilIl1| WWWWWW mmmmmm ......",
+            cell.width, cell.height
+        )
+    }
 }
 
 impl ApplicationHandler for App {
@@ -35,7 +65,15 @@ impl ApplicationHandler for App {
             }
         };
         let size = window.inner_size();
-        match pollster::block_on(Renderer::new(window.clone(), size.width, size.height)) {
+        let scale = window.scale_factor() as f32;
+        let init = Renderer::new(
+            window.clone(),
+            size.width,
+            size.height,
+            scale,
+            FontConfig::default(),
+        );
+        match pollster::block_on(init) {
             Ok(renderer) => self.renderer = Some(renderer),
             Err(e) => {
                 log::error!("init renderer: {e:#}");
@@ -58,12 +96,26 @@ impl ApplicationHandler for App {
                     window.request_redraw();
                 }
             }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.set_scale(scale_factor as f32);
+                }
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
             WindowEvent::RedrawRequested => {
-                if let Some(renderer) = &mut self.renderer
-                    && let Err(e) = renderer.render(BACKGROUND)
-                {
-                    log::error!("render: {e:#}");
-                    event_loop.exit();
+                let text = self.demo_text();
+                if let Some(renderer) = &mut self.renderer {
+                    let frame = Frame {
+                        background: BACKGROUND,
+                        foreground: FOREGROUND,
+                        text: &text,
+                    };
+                    if let Err(e) = renderer.render(frame) {
+                        log::error!("render: {e:#}");
+                        event_loop.exit();
+                    }
                 }
             }
             _ => {}
