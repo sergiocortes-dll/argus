@@ -24,6 +24,7 @@ struct App {
     emulator: Emulator,
     cells: Vec<GridCell>,
     mods: Mods,
+    frames: u64,
 }
 
 impl App {
@@ -36,6 +37,7 @@ impl App {
             emulator: Emulator::new(80, 24),
             cells: Vec::new(),
             mods: Mods::default(),
+            frames: 0,
         }
     }
 
@@ -121,7 +123,16 @@ impl App {
             cols: screen.cols,
             background: screen.background,
             cells: &self.cells,
-        })
+        })?;
+        self.frames += 1;
+        match self.frames {
+            1 => diag::checkpoint("first frame"),
+            100 => diag::checkpoint("frame 100"),
+            500 => diag::checkpoint("frame 500"),
+            2000 => diag::checkpoint("frame 2000"),
+            _ => {}
+        }
+        Ok(())
     }
 
     fn request_redraw(&self) {
@@ -138,7 +149,10 @@ impl ApplicationHandler<AppEvent> for App {
         }
         let attrs = Window::default_attributes().with_title("Argus");
         let window = match event_loop.create_window(attrs) {
-            Ok(w) => Arc::new(w),
+            Ok(w) => {
+                diag::checkpoint("window");
+                Arc::new(w)
+            }
             Err(e) => {
                 log::error!("create window: {e}");
                 event_loop.exit();
@@ -165,6 +179,7 @@ impl ApplicationHandler<AppEvent> for App {
         self.window = Some(window);
         self.resize_grid();
         self.spawn_shell();
+        diag::checkpoint("shell spawned");
         self.request_redraw();
     }
 
@@ -267,9 +282,30 @@ fn to_grid_cell(c: &ScreenCell) -> GridCell {
     }
 }
 
+/// On hybrid laptops, implicit layers (OBS, overlays) and the discrete GPU's driver each wake
+/// that GPU (~1 s). Implicit layers are always skipped; `ARGUS_VULKAN_DRIVERS` (e.g. `*amd*`)
+/// restricts drivers for Argus only. Values the user already set win.
+#[allow(unsafe_code)]
+fn configure_vulkan_loader() {
+    let mut vars = vec![("VK_LOADER_LAYERS_DISABLE", "~implicit~".into())];
+    if let Some(drivers) = std::env::var_os("ARGUS_VULKAN_DRIVERS") {
+        vars.push(("VK_LOADER_DRIVERS_SELECT", drivers));
+    }
+    for (name, value) in vars {
+        if std::env::var_os(name).is_none() {
+            // SAFETY: called first in `main`, before any other thread exists.
+            unsafe { std::env::set_var(name, value) };
+        }
+    }
+}
+
 fn main() -> Result<()> {
+    configure_vulkan_loader();
+    diag::start();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    diag::checkpoint("process start");
     let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
+    diag::checkpoint("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App::new(event_loop.create_proxy());
     event_loop.run_app(&mut app)?;

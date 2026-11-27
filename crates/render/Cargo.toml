@@ -9,7 +9,9 @@ license.workspace = true
 wgpu.workspace = true
 log.workspace = true
 anyhow.workspace = true
+diag.workspace = true
 glyphon.workspace = true
+sys-locale.workspace = true
 
 [lints]
 workspace = true

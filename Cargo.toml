@@ -16,13 +16,16 @@ pollster = "1"
 log = "0.4"
 env_logger = "0.11"
 anyhow = "1"
+memory-stats = "1"
+diag = { path = "crates/diag" }
 glyphon = "0.12"
+sys-locale = "0.3"
 portable-pty = "0.9"
 alacritty_terminal = "0.26"
 terminal-infra = { path = "crates/terminal-infra" }
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

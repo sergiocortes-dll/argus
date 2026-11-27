@@ -1,3 +1,4 @@
+mod fonts;
 mod rects;
 mod text;
 
@@ -49,21 +50,16 @@ impl Renderer {
     where
         W: wgpu::wgt::WgpuHasDisplayHandle + Clone + Into<wgpu::SurfaceTarget<'static>>,
     {
-        let instance = wgpu::Instance::new(
-            wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(window.clone())),
-        );
-        let surface = instance.create_surface(window).context("create surface")?;
-
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-                apply_limit_buckets: false,
-            })
-            .await
-            .context("request adapter")?;
+        let preferred = wgpu::Backends::from_env().unwrap_or(native_backend());
+        let (surface, adapter) = match init_gpu(window.clone(), preferred).await {
+            Ok(gpu) => gpu,
+            Err(e) => {
+                log::warn!("{preferred:?} unavailable ({e:#}), trying every backend");
+                init_gpu(window, wgpu::Backends::all()).await?
+            }
+        };
         log::info!("adapter: {:?}", adapter.get_info());
+        diag::checkpoint("adapter");
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -74,6 +70,7 @@ impl Renderer {
             })
             .await
             .context("request device")?;
+        diag::checkpoint("device");
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps
@@ -96,7 +93,9 @@ impl Renderer {
         };
         surface.configure(&device, &config);
         let text = TextGrid::new(&device, &queue, format, font, scale);
+        diag::checkpoint("text grid");
         let rects = RectRenderer::new(&device, format);
+        diag::checkpoint("pipelines");
 
         Ok(Self {
             surface,
@@ -199,6 +198,41 @@ impl Renderer {
         }
         Ok(())
     }
+}
+
+/// Initializing every backend also loads drivers that are never used (e.g. OpenGL on Windows).
+fn native_backend() -> wgpu::Backends {
+    if cfg!(target_os = "macos") {
+        wgpu::Backends::METAL
+    } else {
+        wgpu::Backends::VULKAN
+    }
+}
+
+async fn init_gpu<W>(
+    window: W,
+    backends: wgpu::Backends,
+) -> Result<(wgpu::Surface<'static>, wgpu::Adapter)>
+where
+    W: wgpu::wgt::WgpuHasDisplayHandle + Clone + Into<wgpu::SurfaceTarget<'static>>,
+{
+    let mut desc =
+        wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(window.clone()));
+    desc.backends = backends;
+    let instance = wgpu::Instance::new(desc);
+    diag::checkpoint("instance");
+    let surface = instance.create_surface(window).context("create surface")?;
+    diag::checkpoint("surface");
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        })
+        .await
+        .context("request adapter")?;
+    Ok((surface, adapter))
 }
 
 /// Backgrounds that differ from the default (merged per row) and underlines.

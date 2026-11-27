@@ -65,7 +65,8 @@ impl TextGrid {
         font: FontConfig,
         scale: f32,
     ) -> Self {
-        let mut font_system = FontSystem::new();
+        let mut font_system = crate::fonts::font_system(font.family.as_deref());
+        diag::checkpoint("font system");
         let cache = Cache::new(device);
         let viewport = Viewport::new(device, &cache);
         let mut atlas = TextAtlas::new(device, queue, &cache, format);
